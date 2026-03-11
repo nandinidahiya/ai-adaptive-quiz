@@ -1,143 +1,105 @@
 /**
- * /api/chat.js — Vercel Serverless Function
- * Secure AI proxy: key never exposed to client.
- * Provider-independent: swap PROVIDER env var to switch AI backends.
+ * /api/chat.js — Vercel Serverless Proxy for Groq
+ * Your GROQ_API_KEY lives here as an env var — never exposed to browser.
+ * Called by the quiz frontend on every question generation.
  */
 
-const PROVIDERS = {
-  anthropic: {
-    url: "https://api.anthropic.com/v1/messages",
-    buildHeaders: (key) => ({
-      "x-api-key": key,
-      "anthropic-version": "2023-06-01",
-      "Content-Type": "application/json",
-    }),
-    buildBody: ({ messages, model, system, max_tokens }) => ({
-      model: model || "claude-sonnet-4-20250514",
-      max_tokens: max_tokens || 1024,
-      system: system || "You are a helpful assistant.",
-      messages,
-    }),
-    extractReply: (data) => data?.content?.[0]?.text || "",
-    extractUsage: (data) => data?.usage || {},
-  },
-
-  openai: {
-    url: "https://api.openai.com/v1/chat/completions",
-    buildHeaders: (key) => ({
-      Authorization: `Bearer ${key}`,
-      "Content-Type": "application/json",
-    }),
-    buildBody: ({ messages, model, system, max_tokens }) => ({
-      model: model || "gpt-4o",
-      max_tokens: max_tokens || 1024,
-      messages: [
-        { role: "system", content: system || "You are a helpful assistant." },
-        ...messages,
-      ],
-    }),
-    extractReply: (data) => data?.choices?.[0]?.message?.content || "",
-    extractUsage: (data) => data?.usage || {},
-  },
-
-  groq: {
-    url: "https://api.groq.com/openai/v1/chat/completions",
-    buildHeaders: (key) => ({
-      Authorization: `Bearer ${key}`,
-      "Content-Type": "application/json",
-    }),
-    buildBody: ({ messages, model, system, max_tokens }) => ({
-      model: model || "llama-3.3-70b-versatile",
-      max_tokens: max_tokens || 1024,
-      messages: [
-        { role: "system", content: system || "You are a helpful assistant." },
-        ...messages,
-      ],
-    }),
-    extractReply: (data) => data?.choices?.[0]?.message?.content || "",
-    extractUsage: (data) => data?.usage || {},
-  },
-};
-
-// CORS headers — allow any browser origin
 const CORS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
 };
+
+// Model priority: best accuracy first, fallback second
+const MODELS = ['llama-3.3-70b-versatile', 'llama3-70b-8192'];
 
 export default async function handler(req, res) {
-  // Handle preflight
-  if (req.method === "OPTIONS") {
-    return res.status(200).set(CORS).end();
+  // Preflight
+  if (req.method === 'OPTIONS') {
+    Object.entries(CORS).forEach(([k, v]) => res.setHeader(k, v));
+    return res.status(200).end();
   }
 
   Object.entries(CORS).forEach(([k, v]) => res.setHeader(k, v));
 
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  // Resolve provider from env (default: anthropic)
-  const providerName = (process.env.PROVIDER || "anthropic").toLowerCase();
-  const provider = PROVIDERS[providerName];
-
-  if (!provider) {
-    return res.status(500).json({
-      error: `Unknown provider "${providerName}". Valid: ${Object.keys(PROVIDERS).join(", ")}`,
-    });
-  }
-
-  // Pick the right API key env var
-  const KEY_MAP = {
-    anthropic: "ANTHROPIC_API_KEY",
-    openai: "OPENAI_API_KEY",
-    groq: "GROQ_API_KEY",
-  };
-  const apiKey = process.env[KEY_MAP[providerName]];
-
+  const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) {
     return res.status(500).json({
-      error: `Missing env var: ${KEY_MAP[providerName]}. Add it in Vercel dashboard → Settings → Environment Variables.`,
+      error: 'GROQ_API_KEY not set. Add it in Vercel → Settings → Environment Variables.'
     });
   }
 
   let body;
   try {
-    body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+    body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
   } catch {
-    return res.status(400).json({ error: "Invalid JSON body" });
+    return res.status(400).json({ error: 'Invalid JSON body' });
   }
 
-  const { messages, model, system, max_tokens } = body || {};
+  const { prompt, model: requestedModel } = body || {};
+  if (!prompt) return res.status(400).json({ error: '`prompt` is required' });
 
-  if (!messages || !Array.isArray(messages) || messages.length === 0) {
-    return res.status(400).json({ error: "`messages` array is required" });
-  }
+  // Try requested model first, then fallback chain
+  const modelsToTry = requestedModel
+    ? [requestedModel, ...MODELS.filter(m => m !== requestedModel)]
+    : MODELS;
 
-  try {
-    const upstream = await fetch(provider.url, {
-      method: "POST",
-      headers: provider.buildHeaders(apiKey),
-      body: JSON.stringify(provider.buildBody({ messages, model, system, max_tokens })),
-    });
+  let lastError = 'Unknown error';
 
-    const data = await upstream.json();
-
-    if (!upstream.ok) {
-      return res.status(upstream.status).json({
-        error: data?.error?.message || data?.error || "Upstream API error",
-        raw: data,
+  for (const model of modelsToTry) {
+    try {
+      const upstream = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 520,
+          temperature: 0.7,
+        }),
       });
-    }
 
-    return res.status(200).json({
-      reply: provider.extractReply(data),
-      usage: provider.extractUsage(data),
-      provider: providerName,
-      model: data?.model || model,
-    });
-  } catch (err) {
-    return res.status(500).json({ error: err.message || "Internal server error" });
+      // Model unavailable — try next
+      if (upstream.status === 503 || upstream.status === 404) {
+        lastError = `Model ${model} unavailable`;
+        continue;
+      }
+
+      // Rate limit — return to client so it can retry
+      if (upstream.status === 429) {
+        const data = await upstream.json().catch(() => ({}));
+        return res.status(429).json({
+          error: 'Rate limited',
+          retryAfter: upstream.headers.get('retry-after') || 5,
+        });
+      }
+
+      if (!upstream.ok) {
+        const data = await upstream.json().catch(() => ({}));
+        lastError = data?.error?.message || `HTTP ${upstream.status}`;
+        continue;
+      }
+
+      const data = await upstream.json();
+      const content = data?.choices?.[0]?.message?.content || '';
+
+      return res.status(200).json({
+        content,
+        model,
+        usage: data?.usage || {},
+      });
+
+    } catch (err) {
+      lastError = err.message || String(err);
+    }
   }
+
+  return res.status(502).json({ error: lastError });
 }
