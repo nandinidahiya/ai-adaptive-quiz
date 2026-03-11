@@ -1,16 +1,6 @@
 {
-  "name": "neural-proxy",
+  "name": "easa-quiz-proxy",
   "version": "1.0.0",
-  "description": "Serverless AI proxy — provider-independent, key-secure, browser-ready",
   "private": true,
-  "engines": {
-    "node": ">=20"
-  },
-  "scripts": {
-    "dev": "vercel dev",
-    "deploy": "vercel --prod"
-  },
-  "devDependencies": {
-    "vercel": "^37.0.0"
-  }
+  "engines": { "node": ">=20" }
 }
